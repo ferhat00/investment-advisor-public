@@ -1,0 +1,7 @@
+# Investment-Advisor tool library — runtime dependencies (Python 3.10+)
+# House style: statistics are numpy-only (no scipy/statsmodels by design — see tools/common.py)
+numpy>=1.26,<3
+pandas>=2.1
+yfinance>=0.2.40
+lxml>=4.9          # yfinance get_earnings_dates dependency (event_calendar.py)
+plotly>=5

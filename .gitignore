@@ -1,0 +1,27 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Tool error captures (anywhere) — incl. legacy drifted names in old runs
+*.err
+theses/**/_e*.txt
+theses/**/*_err.txt
+
+# Raw MCP tool-result dumps (IBKR trade exports etc.) — the distilled *.json is the memory
+theses/**/mcp-*.txt
+
+# Regenerable run artifacts — the markdown/JSON memory in theses/ stays tracked
+theses/**/*.csv
+theses/**/*.html
+theses/**/*.pdf
+theses/**/*.png
+theses/**/*.ipynb
+theses/**/logs/
+theses/**/.cache/
+
+# Keep the offline smoke-test fixture whole (tests/ depends on it)
+!theses/NVDA-smoketest/**
+
+# Ad-hoc analysis scratch and archived one-off deliverables
+analysis/
+archive/

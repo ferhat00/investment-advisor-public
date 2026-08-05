@@ -1,0 +1,14 @@
+target-version = "py310"
+line-length = 120
+
+# theses/ holds generated thesis outputs (Markdown/JSON + exported notebooks) and the
+# NVDA-smoketest fixture — deliverables and fixtures, not maintained source. Not linted.
+extend-exclude = ["theses"]
+
+[lint]
+# High-signal only: pyflakes (F — undefined names, unused imports/variables, bad f-strings),
+# syntax/IO errors (E9), and whitespace/escape-sequence warnings (W). The codebase's
+# deliberate dense style — one-statement-per-line semicolons/colons (E701/E702), long lines
+# (E501), and the sys.path-bootstrap-before-local-imports pattern (E402) — is intentional
+# and left unlinted. Existing `# noqa` comments are still honored.
+select = ["F", "E9", "W"]

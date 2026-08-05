@@ -168,7 +168,6 @@ def _legs(ticker, sf):
         L["gp_to_assets"] = _safe(gp, ta)                      # Novy-Marx
         sga = f.sga(0) or 0
         op = (gp - sga) if gp is not None else None            # operating profit (SG&A excl R&D in yf)
-        d_rec = _safe((f.receivables(0) or 0) - (f.receivables(1) or 0), 1)
         d_inv = (f.inventory(0) or 0) - (f.inventory(1) or 0)
         pay0 = f.B(["Accounts Payable", "Payables"], 0) or 0
         pay1 = f.B(["Accounts Payable", "Payables"], 1) or 0

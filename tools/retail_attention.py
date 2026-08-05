@@ -17,7 +17,6 @@ range context to tell euphoric-attention (near highs) from panic-attention (near
 CLI: python retail_attention.py NVDA
 """
 import sys
-import numpy as np
 from common import jprint, rnd, yf_history, attention_data, main_guard
 
 

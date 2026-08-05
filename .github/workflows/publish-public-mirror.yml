@@ -1,0 +1,38 @@
+name: Publish public mirror
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "Public repo (owner/name) to force-push the sanitized snapshot to"
+        required: true
+      branch:
+        description: "Target branch"
+        required: false
+        default: main
+      dry_run:
+        description: "Dry run (stage + forbidden-string scan only, no push)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Publish sanitized snapshot
+        env:
+          MIRROR_TOKEN: ${{ secrets.PUBLIC_MIRROR_TOKEN }}
+        run: |
+          REMOTE="https://x-access-token:${MIRROR_TOKEN}@github.com/${{ inputs.target_repo }}.git"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python3 scripts/sync_public.py --remote "$REMOTE" --branch "${{ inputs.branch }}"
+          else
+            python3 scripts/sync_public.py --remote "$REMOTE" --branch "${{ inputs.branch }}" --push
+          fi

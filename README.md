@@ -21,7 +21,7 @@ In a Cowork/Claude session with this folder mounted, just say what you want in p
 **Control the horizon & sizing**
 - `6-month thesis on GOOG` / `Multi-year owner's view on ASML`
 - `Swing-trade view on NBIS into earnings (days–weeks)`
-- `Size a starter in URNM at 1% NAV risk instead of the default 2%`
+- `Size a starter in URNM at 1% NAV risk instead of the default 3%`
 
 **Portfolio & position actions** (pulls live IBKR positions first)
 - `Should I add to my URNM position?`

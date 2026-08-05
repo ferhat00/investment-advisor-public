@@ -15,6 +15,7 @@ import argparse
 import datetime
 import os
 import re
+import numpy as np
 from common import jprint, rnd, parse_list, safe, yf_history, main_guard
 
 _HEADER = re.compile(r"^###\s+(DEC-\d+)\s+[—–-]+\s+(\d{4}-\d{2}-\d{2})\s+[—–-]+\s+(.*)$")
@@ -122,6 +123,12 @@ def score_entry(e, errs):
         e["gap"] = f"no price data for {t}"
         return
     last = float(hist["Close"].iloc[-1])
+    if not np.isfinite(last):
+        # A NaN last close would silently grade the call "wrong" (NaN > 0 is False) and then
+        # blow up the by-stance average, since rnd(NaN) is None. Degrade with a stated gap.
+        e["scoring"] = "skipped"
+        e["gap"] = f"last close for {t} is not finite (stale/suspended line)"
+        return
     e["last_close"] = rnd(last, 4)
     e["last_close_date"] = hist.index[-1].strftime("%Y-%m-%d")
     pct = (last / ref - 1.0) * 100.0

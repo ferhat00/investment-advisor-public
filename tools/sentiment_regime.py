@@ -27,7 +27,7 @@ import os
 import sys
 import math
 import numpy as np
-from common import jprint, rnd, fred, yf_history, safe, main_guard
+from common import jprint, rnd, fred, safe, main_guard
 
 
 def _pct_current(series, high_is_high_sentiment):

@@ -159,6 +159,19 @@ def _yahoo_chart_fallback(ticker, period, interval):
         df["Close"] = adj_s
     return df.dropna(how="all")
 
+def _drop_unconfirmed_weekend_row(df):
+    """Drop trailing Sat/Sun rows from a daily-bar frame. FX crosses (`=X`) trade
+    through the weekend edge (Asia opens Sunday evening ET), and Yahoo can append
+    that still-forming reopen print as a "daily" bar dated to the weekend day it
+    started on -- flat OHLC, zero volume, and not a confirmed close. Seen live:
+    JPY=X carrying a Sunday row 1.7% off the prior Friday close, which fed through
+    every downstream technical indicator as if it were real. No confirmed daily
+    session for any ticker in this codebase (equities, ETFs, indices) ever falls
+    on a weekend, so this is a no-op for everything except FX."""
+    while len(df) and df.index[-1].weekday() >= 5:
+        df = df.iloc[:-1]
+    return df
+
 def yf_history(ticker, period="2y", interval="1d"):
     """Price history via yfinance. Cached + retried; a genuinely empty ticker
     raises ValueError immediately (not retried, not cached). Falls back to the
@@ -176,6 +189,10 @@ def yf_history(ticker, period="2y", interval="1d"):
             raise ValueError(f"No price data for {ticker}")
         if getattr(df.index, "tz", None) is not None:
             df.index = df.index.tz_localize(None)
+        if interval == "1d":
+            df = _drop_unconfirmed_weekend_row(df)
+        if df.empty:
+            raise ValueError(f"No price data for {ticker}")
         return df
     return _cached("yf", f"{ticker}|{period}|{interval}",
                    lambda: _retry(_fetch, no_retry=(ValueError,)))
@@ -191,6 +208,71 @@ def yf_statements(ticker):
     import yfinance as yf
     t = yf.Ticker(ticker)
     return t.income_stmt, t.balance_sheet, t.cashflow
+
+
+def _install_yahoo_urllib_shim():
+    """Route yfinance's ``.info`` / statements / recommendations / ``.history``
+    through the urllib transport (``yahoo_urllib``) because curl_cffi's TLS gets
+    reset behind the egress proxy. Idempotent; no-ops if yfinance/yahoo_urllib
+    aren't importable. Called once at module import so every tool that does
+    ``from common import ...`` gets the patched yfinance for free."""
+    try:
+        import yfinance as yf
+        import yahoo_urllib as Y
+    except Exception:
+        return
+    T = yf.Ticker
+    if getattr(T, "_ic_urllib_shim", False):
+        return
+
+    def _sym(self):
+        return getattr(self, "ticker", None) or getattr(self, "_ticker", None)
+
+    def _stmts(self):
+        cached = self.__dict__.get("_ic_stmts")
+        if cached is None:
+            cached = Y.get_statements(_sym(self))
+            self.__dict__["_ic_stmts"] = cached
+        return cached
+
+    T.info = property(lambda self: Y.get_info(_sym(self)))
+    T.get_info = lambda self, *a, **k: Y.get_info(_sym(self))
+    T.income_stmt = property(lambda self: _stmts(self)[0])
+    T.financials = property(lambda self: _stmts(self)[0])
+    T.get_income_stmt = lambda self, *a, **k: _stmts(self)[0]
+    T.balance_sheet = property(lambda self: _stmts(self)[1])
+    T.balancesheet = property(lambda self: _stmts(self)[1])
+    T.get_balance_sheet = lambda self, *a, **k: _stmts(self)[1]
+    T.cashflow = property(lambda self: _stmts(self)[2])
+    T.cash_flow = property(lambda self: _stmts(self)[2])
+    T.get_cashflow = lambda self, *a, **k: _stmts(self)[2]
+    T.recommendations = property(lambda self: Y.get_recommendations(_sym(self)))
+    # Without this, tools/dividend_analysis.py returns "no dividend history" for every
+    # ticker — yfinance's own `.dividends` goes through the curl_cffi path the proxy resets,
+    # and the shim patched everything around it. Found by the `income` seat on 2026-07-29,
+    # which had to re-implement the whole tool against the chart endpoint to do its job.
+    T.dividends = property(lambda self: Y.get_dividends(_sym(self)))
+    T.get_dividends = lambda self, *a, **k: Y.get_dividends(_sym(self))
+
+    _orig_hist = T.history
+
+    def _history(self, period="1mo", interval="1d", *a, **k):
+        try:
+            df = _orig_hist(self, period=period, interval=interval, *a, **k)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            pass
+        try:
+            return _yahoo_chart_fallback(_sym(self), period, interval)
+        except Exception:
+            return pd.DataFrame()
+
+    T.history = _history
+    T._ic_urllib_shim = True
+
+
+_install_yahoo_urllib_shim()
 
 def stmt_row(df, names, n=1):
     """Pull a statement row by trying each alias in `names`; return the first `n` columns
@@ -211,6 +293,39 @@ def stmt_row(df, names, n=1):
 def stmt_val(df, names, idx=0):
     """Single value: alias lookup at column idx (0 = most recent). None if absent."""
     return stmt_row(df, names, n=idx + 1)[idx]
+
+
+# Yahoo quotes some venues in the MINOR currency unit while statements are reported in the
+# major one. Keys are case-sensitive on purpose: Yahoo's pence code is "GBp", which differs
+# from real pounds "GBP" only by case, so an .upper() here would silently divide every
+# GBP-quoted name by 100.
+_MINOR_UNIT_QUOTES = {
+    "GBp": 0.01,   # LSE quotes pence, statements in pounds
+    "GBX": 0.01,   # same, alternate code
+    "ZAc": 0.01,   # JSE quotes cents
+    "ILA": 0.01,   # TASE quotes agorot
+}
+
+def minor_unit_scale(info):
+    """Multiplier converting a Yahoo quote into the major currency unit its statements use.
+
+    Any per-share value derived from a balance sheet (RIM, ICC, DCF) is 100x out against a
+    raw LSE quote unless this is applied — the classic UK valuation error. Mirrors the
+    marketCap convention already used in yahoo_urllib. Returns 1.0 for normal venues.
+
+    NOTE this fixes the unit only, never the currency: an LSE name that REPORTS in USD
+    (HSBC, Standard Chartered) still needs an explicit FX conversion on top."""
+    return _MINOR_UNIT_QUOTES.get((info or {}).get("currency") or "", 1.0)
+
+def quote_price(info, price_scale=1.0):
+    """Live price expressed in the statements' currency unit.
+
+    `price_scale` is the caller's optional FX factor for the cross-currency case above
+    (e.g. pass GBPUSD spot for HSBA.L, which quotes in pence but reports in USD)."""
+    px = (info or {}).get("currentPrice") or (info or {}).get("regularMarketPrice")
+    if px is None:
+        return None
+    return float(px) * minor_unit_scale(info) * (price_scale or 1.0)
 
 # --- Non-FRED fetch + graceful-degradation + numpy-only stats (macro pack helpers) ---
 

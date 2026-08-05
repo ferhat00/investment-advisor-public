@@ -24,7 +24,6 @@ CLI:
 """
 import argparse
 import numpy as np
-import pandas as pd
 from common import jprint, rnd, yf_history, main_guard
 
 MU1_SQ = np.pi / 2.0          # 1/mu1^2 with mu1 = E|Z| = sqrt(2/pi); scales BV to variance

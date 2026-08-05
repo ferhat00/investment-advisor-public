@@ -100,6 +100,24 @@ def _cot_pull(name_filter):
     return net, oi
 
 
+def _direction_4w(last, prev):
+    """Specs 'building' vs 'reducing' their net position over the trailing 4 weeks, judged by
+    whether the position grew MORE EXTREME in its own direction -- not by the raw signed
+    value, which only reads right for net longs. A net SHORT that grew from -155,092 to
+    -163,412 is building (adding to the short), even though -163,412 < -155,092; a short
+    that covered from -145,818 to -123,778 is reducing, even though -123,778 > -145,818.
+    (Caught independently in two committee runs: LJPY-2026-08-02 and the USDJPY-2026-07-14
+    redteam-bear report, both against the old last > prev comparison.)"""
+    if prev is None:
+        return None
+    delta = last - prev
+    if delta == 0:
+        return "unchanged"
+    if last >= 0:
+        return "building" if delta > 0 else "reducing"
+    return "building" if delta < 0 else "reducing"
+
+
 def cot(market):
     market = market.lower()
     if market not in COT_MARKETS:
@@ -135,7 +153,7 @@ def cot(market):
         "net_position_pctile": rnd(pct, 2) if pct is not None else None,
         "net_position_z_5y": rnd(z, 2),
         "net_position_4w_ago": rnd(prev, 0) if prev is not None else None,
-        "direction_4w": ("building" if prev is not None and last > prev else "reducing") if prev is not None else None,
+        "direction_4w": _direction_4w(last, prev),
         "extreme_flag": extreme,
         "as_of": str(net.index[-1].date()),
         "read": read,

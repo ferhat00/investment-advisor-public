@@ -34,6 +34,11 @@ import forensic, credit_tools, valuation
 
 # --------------------------------- helpers ---------------------------------
 
+_FCF_CCY_CAVEAT = (
+    "FCF yield divides statement-currency free cash flow by quote-currency market cap. For a name that quotes in one currency and reports in another (SHEL.L quotes GBp, reports USD) it is overstated by the FX rate -- 12.66% against a true 9.40%. yfinance financialCurrency is unavailable through the urllib fallback transport, so this cannot be auto-corrected here; verify the reporting currency before quoting it."
+)
+
+
 def _safe(a, b):
     try:
         return a / b if (a is not None and b not in (None, 0)) else None
@@ -385,6 +390,7 @@ def payout(f, info):
     sbc = abs(_sbc(f, 0) or 0)
 
     fcf_yield = _safe(fcf, mc)
+    # CURRENCY CAVEAT (found by `fundamental`, 2026-07-30): see fcf_yield_currency_caveat below.
     accretion = None
     if fcf_yield is not None:
         accretion = ("accretive — buybacks at FCF yield %.1f%% above cost of capital" % (100 * fcf_yield)
@@ -563,7 +569,9 @@ def all_quality(ticker, peers, wacc=0.09, moat=None):
     q_verdict = panel.get("quality_verdict") if isinstance(panel, dict) else None
     beta = info.get("beta")
     fcf_yield = _safe(info.get("freeCashflow"), info.get("marketCap"))
+    # CURRENCY CAVEAT (found by `fundamental`, 2026-07-30): see fcf_yield_currency_caveat below.
     safety = (panel.get("pillars", {}).get("safety", {}) if isinstance(panel, dict) else {})
+    out["fcf_yield_currency_caveat"] = _FCF_CCY_CAVEAT
     out["cheap_safe_quality_signature"] = {
         "quality": q_verdict,
         "safety_low_beta": rnd(beta, 2),

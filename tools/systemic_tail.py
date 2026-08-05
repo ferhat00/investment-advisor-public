@@ -40,7 +40,6 @@ CLI:
   python systemic_tail.py pca  --book portfolio_context.json
   python systemic_tail.py pca  --peers NVDA,AMD,AVGO,MU,QCOM,TSM
 """
-import sys
 import json
 import os
 import argparse

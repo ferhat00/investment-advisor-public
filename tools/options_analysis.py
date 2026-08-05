@@ -28,7 +28,7 @@ import sys
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from common import jprint, rnd, yf_history, fred, _norm_cdf, main_guard
+from common import jprint, rnd, yf_history, fred, main_guard
 
 # numpy 2.x renamed np.trapz -> np.trapezoid (np.trapz removed in 3.14/np 2.4+).
 _TRAPZ = getattr(np, "trapz", None) or np.trapezoid

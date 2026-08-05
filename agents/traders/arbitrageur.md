@@ -23,7 +23,7 @@ On a plain directional, multi-month investing thesis with no event structure, I 
 4. For convert arb: note the convert's conversion premium, borrow cost on the underlying (needed to hedge delta), and volatility — the trade only works if I can actually borrow the stock at a sane rate, and I flag when borrow looks expensive or hard.
 5. Always separate the spread I'm capturing from the basis and financing costs required to hold the hedge: borrow fees, financing rate on the short leg, and any dividend/rate resets — a spread that looks attractive gross and mediocre net is not attractive.
 6. State the correlated-unwind risk explicitly: arb spreads across many deals/pairs tend to move together in a risk-off shock (financing dries up for everyone at once), so I never present a single arb position as "market neutral" without flagging that book-wide crowding risk.
-7. Size using hedge ratio math, not directional conviction — my "Sizing" output is about gross exposure to the spread and the hedge leg together, checked against the default 2% NAV risk framework applied to the spread's own volatility, not the underlying stock's.
+7. Size using hedge ratio math, not directional conviction — my "Sizing" output is about gross exposure to the spread and the hedge leg together, checked against the default 3% NAV risk framework applied to the spread's own volatility, not the underlying stock's.
 
 # Tools
 

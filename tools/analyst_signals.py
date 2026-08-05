@@ -22,7 +22,6 @@ the signal gives direction; the agent judges whether it is fresh deterioration o
 CLI: python analyst_signals.py NVDA
 """
 import sys
-import numpy as np
 import yfinance as yf
 from common import jprint, rnd, main_guard
 from market_data import _analyst_distribution

@@ -62,6 +62,8 @@ def analyze(df):
     vol20 = df.Volume.rolling(20).mean()
     out = {
         "last": rnd(last),
+        "asof_date": str(c.index[-1].date()),
+        "asof_confirmed_session": bool(c.index[-1].weekday() < 5),
         "ema20": rnd(e20.iloc[-1]), "ema50": rnd(e50.iloc[-1]), "ema200": rnd(e200.iloc[-1]),
         "above_ema200": bool(last > e200.iloc[-1]),
         "ema50_vs_200": "golden" if e50.iloc[-1] > e200.iloc[-1] else "death",
@@ -69,7 +71,12 @@ def analyze(df):
         "macd_hist": rnd(mh.iloc[-1], 3), "macd_cross": "bull" if m.iloc[-1] > ms.iloc[-1] else "bear",
         "atr14": rnd(a.iloc[-1]), "atr_pct": rnd(100 * a.iloc[-1] / last),
         "adx14": rnd(ax.iloc[-1]), "di_bias": "bull" if pdi.iloc[-1] > mdi.iloc[-1] else "bear",
-        "bb_pos": rnd((last - bb_mid.iloc[-1]) / (2 * bb_sd.iloc[-1]), 2),
+        # bb_sigma = true stdev distance from the 20d mean; bb_band_units = the same
+        # distance in half-band widths (band edge = +-1.0, since a std BB is mid +-2sd)
+        # -- exactly 2x smaller. A run once misread bb_band_units as raw sigma and
+        # understated a stretch by 2x, so both are emitted rather than one ambiguous field.
+        "bb_sigma": rnd((last - bb_mid.iloc[-1]) / bb_sd.iloc[-1], 2),
+        "bb_band_units": rnd((last - bb_mid.iloc[-1]) / (2 * bb_sd.iloc[-1]), 2),
         "pct_off_52w_high": rnd(100 * (last / c.tail(252).max() - 1)),
         "pct_above_52w_low": rnd(100 * (last / c.tail(252).min() - 1)),
         "ret_1m_pct": rnd(100 * (last / c.iloc[-21] - 1)),

@@ -14,17 +14,28 @@ CLI:
   python valuation.py netnet NVDA                   # Graham NCAV / net-net / liquidation floor
 
 Design notes:
-- `dcf_value()` (unchanged) and the `dcf --fade-model const` default reproduce the original
-  two-stage-with-fade output exactly, so existing theses stay reproducible.
+- `dcf_value()` is a pure FCFF function: it discounts the flow it is given at WACC and then
+  subtracts net debt. It is unchanged and still reproduces the original two-stage-with-fade
+  arithmetic for any given input.
+- CASH-FLOW BASIS FIX (2026-07-28): `_base_inputs()` used to hand `dcf_value()` yfinance's
+  `freeCashflow`, which is LEVERED (OCF is struck after the `Interest Paid Cfo` line). Being
+  discounted at WACC and then netted against debt, the debt was charged twice and every fair
+  value came out biased LOW. `_base_inputs()` now returns FCFF (= levered FCF + after-tax
+  interest, see `_unlever_fcf`) and reports the reconciliation as `fcff_reconciliation` in the
+  `dcf` and `reverse` output. This moves `dcf`/`reverse`/`mc`/`scenario`; `epv`/`netnet` never
+  used the FCF value. **DCF/reverse figures in theses/ runs dated before 2026-07-28 were
+  produced by the broken basis and are not comparable to later ones.**
 - `--fade-model ff` replaces the hand-picked fade with a Fama-French ~38%/yr reversion of
   growth toward terminal over a moat-scaled competitive-advantage period (Morningstar mapping).
 - Every intrinsic number is meant as a range: `mc` reports P10/median/P90 and P(value>price);
   `rim` is a book-anchored second model least correlated with the FCFF DCF.
 """
-import sys, argparse
+import argparse
+import sys
+
 import numpy as np
 import yfinance as yf
-from common import jprint, rnd, yf_statements, stmt_val, main_guard, parse_list
+from common import jprint, rnd, yf_statements, stmt_val, main_guard, parse_list, quote_price
 
 FF_REVERSION = 0.38          # Fama-French (2000) ~38%/yr profitability mean-reversion (no-moat baseline)
 FF_HORIZON = 18              # explicit fade horizon before perpetuity (long enough for wide moats to converge)
@@ -33,13 +44,79 @@ FF_HORIZON = 18              # explicit fade horizon before perpetuity (long eno
 MOAT_REVERSION = {"none": 0.44, "narrow": 0.18, "wide": 0.11}
 
 
-def _base_inputs(ticker):
+def _unlever_fcf(fcf_levered, inc, cf):
+    """yfinance `freeCashflow` = Operating Cash Flow - Capex, and OCF is struck AFTER cash
+    interest (the `Interest Paid Cfo` line). It is therefore a LEVERED flow. Discounting it at
+    WACC and then subtracting net debt charges the debt twice — the defect this reverses.
+
+    FCFF = levered FCF + after-tax NET interest (interest paid - interest received). The
+    add-back must be NET, not gross, because the bridge subtracts `net_debt = total debt -
+    total CASH`: crediting the whole cash balance while leaving the interest that cash earns
+    inside the flow would count the cash twice. For a net-cash issuer the term is therefore
+    small — and can be negative, REDUCING the flow. Getting this wrong flatters exactly the
+    firms the raw defect already flatters.
+
+    We prefer the cash lines (`Interest Paid Cfo` / `Interest Received Cfo`) over the accrual
+    income-statement lines, so the adjustment reverses exactly what OCF deducted.
+    Returns (fcff, reconciliation)."""
+    if fcf_levered is None:
+        return None, {"applied": False, "reason": "no levered FCF from yfinance"}
+    paid, received = stmt_val(cf, ["Interest Paid Cfo"]), stmt_val(cf, ["Interest Received Cfo"])
+    basis = "Interest Paid/Received Cfo (cash)"
+    if paid is None:
+        paid = stmt_val(inc, ["Interest Expense", "Interest Expense Non Operating"])
+        received = stmt_val(inc, ["Interest Income", "Interest Income Non Operating"])
+        basis = "Interest Expense/Income (accrual — cash interest lines unavailable)"
+    if paid is None:
+        return fcf_levered, {
+            "applied": False, "fcf_levered": rnd(fcf_levered, 0), "fcff": rnd(fcf_levered, 0),
+            "note": "No interest line found — FCFF could NOT be derived, so the LEVERED flow is "
+                    "discounted at WACC against net debt. This DOUBLE-COUNTS the debt and biases "
+                    "fair value LOW. Treat the DCF as a lower bound.",
+        }
+    tax = _eff_tax(inc)
+    net_interest = abs(paid) - abs(received or 0)
+    adj = net_interest * (1 - tax)
+    return fcf_levered + adj, {
+        "applied": True,
+        "fcf_levered": rnd(fcf_levered, 0),
+        "interest_basis": basis,
+        "interest_paid": rnd(abs(paid), 0),
+        "interest_received": rnd(abs(received or 0), 0),
+        "net_interest_pretax": rnd(net_interest, 0),
+        "eff_tax_rate": rnd(tax, 3),
+        "interest_addback_after_tax": rnd(adj, 0),
+        "fcff": rnd(fcf_levered + adj, 0),
+        "note": "FCFF = levered FCF + after-tax NET interest (paid less received), so the WACC "
+                "discount and the net-debt bridge each charge debt — and credit cash — exactly "
+                "once. A negative add-back is correct for a net-cash issuer.",
+    }
+
+
+def _base_inputs(ticker, price_scale=1.0):
+    """Returns (FCFF, shares, net_debt, price, info, fcff_reconciliation).
+
+    The first element is UNLEVERED (FCFF) — see `_unlever_fcf`. Callers discount it at WACC and
+    subtract net debt, which is only consistent for a firm-level flow."""
     i = yf.Ticker(ticker).info or {}
     fcf = i.get("freeCashflow")
     shares = i.get("sharesOutstanding")
     net_debt = (i.get("totalDebt") or 0) - (i.get("totalCash") or 0)
-    price = i.get("currentPrice") or i.get("regularMarketPrice")
-    return fcf, shares, net_debt, price, i
+    # GBp-quoted LSE names would otherwise be 100x out vs book. price_scale is the SEPARATE
+    # cross-CURRENCY factor for names that quote and report in different currencies (SHEL.L
+    # and HSBA.L quote in pence but report in USD). Until 2026-07-30 this call ignored it, so
+    # --price-scale reached rim/icc only and every DCF-family command silently compared a
+    # sterling price against dollar cash flows. On SHEL.L that reported epv_covers_price true
+    # at +15.9% when the corrected figure is 0.86x, -13.9% -- a sign flip on the verdict.
+    price = quote_price(i, price_scale)
+    try:
+        inc, _bal, cf = yf_statements(ticker)
+        fcff, recon = _unlever_fcf(fcf, inc, cf)
+    except Exception as e:
+        fcff, recon = fcf, {"applied": False, "error": str(e),
+                            "note": "Statement fetch failed — levered FCF used unadjusted; the "
+                                    "DCF double-counts debt and is a LOWER BOUND."}
+    return fcff, shares, net_debt, price, i, recon
 
 
 # --------------------------- statement-derived helpers ---------------------------
@@ -206,15 +283,17 @@ def dcf_from_path(fcf0, growth_path, terminal_g, wacc, net_debt, shares):
     return (ev - net_debt) / shares, {"ev": ev, "tv_pv_share_of_ev": rnd(tv_pv / ev, 2), "years": len(flows)}
 
 
-def dcf(ticker, growth5, fade_g, terminal_g, wacc, fade_model="const", moat=None, normalize_fcf=False):
-    fcf0, shares, net_debt, price, _ = _base_inputs(ticker)
+def dcf(ticker, growth5, fade_g, terminal_g, wacc, fade_model="const", moat=None, normalize_fcf=False, price_scale=1.0):
+    fcf0, shares, net_debt, price, _, fcff_recon = _base_inputs(ticker, price_scale)
     if not fcf0 or not shares:
         return {"error": "missing FCF or share count from yfinance; supply manually"}
     norm = None
     if normalize_fcf:
         norm = normalize(ticker)
         if norm.get("normalized_fcf"):
-            fcf0 = norm["normalized_fcf"]
+            # normalize() also works off the LEVERED `Free Cash Flow` line, so re-apply the
+            # same after-tax interest add-back to keep the flow firm-level.
+            fcf0 = norm["normalized_fcf"] + (fcff_recon.get("interest_addback_after_tax") or 0)
 
     if fade_model == "ff":
         path = _ff_growth_path(growth5, terminal_g, moat)
@@ -225,7 +304,8 @@ def dcf(ticker, growth5, fade_g, terminal_g, wacc, fade_model="const", moat=None
     else:
         fv, meta = dcf_value(fcf0, growth5, fade_g, terminal_g, wacc, net_debt, shares)
 
-    out = {"ticker": ticker, "fcf0_used": rnd(fcf0, 0), "normalized": normalize_fcf,
+    out = {"ticker": ticker, "fcf0_used": rnd(fcf0, 0), "fcf0_basis": "FCFF (unlevered)",
+           "normalized": normalize_fcf, "fcff_reconciliation": fcff_recon,
            "assumptions": {"growth_y1_5": growth5, "fade_to": fade_g, "terminal_g": terminal_g,
                            "wacc": wacc, "fade_model": fade_model, "moat": moat},
            "fair_value": rnd(fv), "price": price,
@@ -276,13 +356,14 @@ def _solve_growth(fcf0, shares, net_debt, price, wacc, terminal_g):
     return mid
 
 
-def reverse_dcf(ticker, wacc, terminal_g, solve="growth"):
+def reverse_dcf(ticker, wacc, terminal_g, solve="growth", price_scale=1.0):
     """Expectations investing: back out the operating driver the market is pricing in, and
     report which driver the valuation is most sensitive to (the 'turbo trigger')."""
-    fcf0, shares, net_debt, price, info = _base_inputs(ticker)
+    fcf0, shares, net_debt, price, info, fcff_recon = _base_inputs(ticker, price_scale)
     if not (fcf0 and shares and price):
         return {"error": "missing inputs from yfinance"}
-    out = {"ticker": ticker, "price": price, "wacc": wacc, "terminal_g": terminal_g, "solve": solve}
+    out = {"ticker": ticker, "price": price, "wacc": wacc, "terminal_g": terminal_g, "solve": solve,
+           "fcf0_basis": "FCFF (unlevered)", "fcff_reconciliation": fcff_recon}
 
     g_impl = _solve_growth(fcf0, shares, net_debt, price, wacc, terminal_g)
     out["implied_fcf_growth_y1_5"] = rnd(g_impl, 3)
@@ -326,7 +407,7 @@ def reverse_dcf(ticker, wacc, terminal_g, solve="growth"):
 
 
 # ------------------------------- residual income -------------------------------
-def rim(ticker, coe, roe_fade_to=None, years=10, raw_book=False):
+def rim(ticker, coe, roe_fade_to=None, years=10, raw_book=False, price_scale=1.0):
     """B2: book-anchored second value. V0 = B0 + Σ PV((ROE_t - coe)·B_{t-1}); ROE fades from
     current to `roe_fade_to` (default = coe, i.e. excess returns compete away -> conservative,
     terminal-value-light). Emits value-to-price (V/P).
@@ -339,7 +420,7 @@ def rim(ticker, coe, roe_fade_to=None, years=10, raw_book=False):
     b0 = stmt_val(bal, ["Common Stock Equity", "Stockholders Equity"])
     ni = stmt_val(inc, ["Net Income", "Net Income Common Stockholders"])
     shares = info.get("sharesOutstanding")
-    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    price = quote_price(info, price_scale)
     if not (b0 and ni and shares):
         return {"error": "missing book value / net income / shares"}
     intangible_adj = False
@@ -355,7 +436,7 @@ def rim(ticker, coe, roe_fade_to=None, years=10, raw_book=False):
     payout = min(max(div / ni, 0.0), 1.0) if ni else 0.0
     fade_to = coe if roe_fade_to is None else roe_fade_to
 
-    book, pv_ri, total_ri = b0, 0.0, 0.0
+    book, pv_ri = b0, 0.0
     schedule = []
     for t in range(1, years + 1):
         roe_t = fade_to + (roe0 - fade_to) * (1 - FF_REVERSION) ** t
@@ -387,11 +468,11 @@ def rim(ticker, coe, roe_fade_to=None, years=10, raw_book=False):
 
 
 # ------------------------------- Monte-Carlo / scenario -------------------------------
-def montecarlo(ticker, draws, growth5, fade_g, terminal_g, wacc):
+def montecarlo(ticker, draws, growth5, fade_g, terminal_g, wacc, price_scale=1.0):
     """B6: distribution of intrinsic value from assumption uncertainty -> P10/median/P90 and
     P(value>price). Directly counters precision-illusion. Input dispersion is anchored to the
     firm's own historical revenue-growth volatility where available."""
-    fcf0, shares, net_debt, price, _ = _base_inputs(ticker)
+    fcf0, shares, net_debt, price, _, _recon = _base_inputs(ticker, price_scale)
     if not (fcf0 and shares and price):
         return {"error": "missing inputs from yfinance"}
     # growth dispersion from historical revenue growth stdev, floored/capped for sanity
@@ -427,8 +508,8 @@ def montecarlo(ticker, draws, growth5, fade_g, terminal_g, wacc):
     }
 
 
-def scenario(ticker, bull, base, bear, probs, fade_g, terminal_g, wacc):
-    fcf0, shares, net_debt, price, _ = _base_inputs(ticker)
+def scenario(ticker, bull, base, bear, probs, fade_g, terminal_g, wacc, price_scale=1.0):
+    fcf0, shares, net_debt, price, _, _recon = _base_inputs(ticker, price_scale)
     if not (fcf0 and shares and price):
         return {"error": "missing inputs from yfinance"}
     labels = {"bull": bull, "base": base, "bear": bear}
@@ -446,7 +527,7 @@ def scenario(ticker, bull, base, bear, probs, fade_g, terminal_g, wacc):
 
 
 # ------------------------------- implied cost of capital -------------------------------
-def icc(ticker, method="hvz", sustainable_roe=0.12):
+def icc(ticker, method="hvz", sustainable_roe=0.12, price_scale=1.0):
     """B7: back the discount rate out of price instead of assuming a WACC. Default HvZ-style
     is filings-only (no analyst forecasts): solve for the cost of equity that equates a
     residual-income valuation to the current price, with ROE fading toward a sustainable
@@ -462,7 +543,7 @@ def icc(ticker, method="hvz", sustainable_roe=0.12):
     b0 = stmt_val(bal, ["Common Stock Equity", "Stockholders Equity"])
     ni = stmt_val(inc, ["Net Income", "Net Income Common Stockholders"])
     shares = info.get("sharesOutstanding")
-    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    price = quote_price(info, price_scale)
     if not (b0 and ni and shares and price):
         return {"error": "missing book / earnings / price"}
     roe0 = ni / b0
@@ -584,7 +665,7 @@ def _reported_intangibles(bal):
     return (gw + oi) if (gw or oi) else 0
 
 
-def epv(ticker, wacc):
+def epv(ticker, wacc, price_scale=1.0):
     """Greenwald-Kahn Earnings Power Value — the most conservative, growth-FREE intrinsic anchor.
     EPV = normalized NOPAT / WACC (no value creation assumed) is a Graham floor. Compared with a
     GOING-CONCERN reproduction value (tangible equity + an internally-estimated reproduction of the
@@ -592,7 +673,7 @@ def epv(ticker, wacc):
     EPV alone already covers the price, the buyer pays nothing for growth (the strongest margin of
     safety). Reproduction here is GOING-CONCERN, explicitly NOT a liquidation floor (that is the
     deep-value-distressed agent's lane; see `netnet`)."""
-    _fcf, shares, net_debt, price, _info = _base_inputs(ticker)
+    _fcf, shares, net_debt, price, _info, _recon = _base_inputs(ticker, price_scale)
     inc, bal, _cf = yf_statements(ticker)
     if not shares:
         return {"error": "missing share count from yfinance"}
@@ -652,7 +733,7 @@ LIQUIDATION_HAIRCUTS = {"cash": 1.00, "receivables": 0.80, "inventory": 0.60,
                         "other_current": 0.50, "net_ppe": 0.20}
 
 
-def netnet(ticker):
+def netnet(ticker, price_scale=1.0):
     """Benjamin Graham's net current asset value (NCAV) and liquidation floor — the cigar-butt
     deep-value asset floor. NCAV = current assets - TOTAL liabilities (fixed assets get no
     going-concern credit). Also net-net working capital (NNWC = cash + haircut receivables/
@@ -660,7 +741,7 @@ def netnet(ticker):
     haircuts. A price below two-thirds of NCAV is the classic Graham deep bargain. This is a
     LIQUIDATION floor (deep-value-distressed's lane), distinct from the going-concern reproduction
     value in `epv` (value agent's lane)."""
-    _fcf, shares, _nd, price, _info = _base_inputs(ticker)
+    _fcf, shares, _nd, price, _info, _recon = _base_inputs(ticker, price_scale)
     _inc, bal, _cf = yf_statements(ticker)
     ca = stmt_val(bal, ["Current Assets", "Total Current Assets"])
     tl = stmt_val(bal, ["Total Liabilities Net Minority Interest", "Total Liabilities"])
@@ -708,6 +789,11 @@ def main():
     p.add_argument("cmd", choices=["dcf", "reverse", "rim", "mc", "scenario", "icc", "comps", "normalize", "epv", "netnet"])
     p.add_argument("ticker")
     p.add_argument("peers", nargs="?", default="")
+    # 0.15 is a DELIBERATELY optimistic placeholder kept for reproducibility of prior runs,
+    # but a bare `dcf`/`mc`/`scenario` call silently embeds a 15% five-year growth rate and
+    # every P(value>price) computed that way reads as a company estimate when it is not.
+    # Found by `fundamental` 2026-07-30, which struck four of its own prior figures on it.
+    # The default stands; what changes is that the output now says where the number came from.
     p.add_argument("--growth5", type=float, default=0.15)
     p.add_argument("--fade", type=float, default=0.05)
     p.add_argument("--tg", type=float, default=0.025)
@@ -719,6 +805,11 @@ def main():
     p.add_argument("--coe", type=float, default=0.10)
     p.add_argument("--roe-fade-to", dest="roe_fade_to", type=float, default=None)
     p.add_argument("--raw-book", dest="raw_book", action="store_true", help="RIM: use statutory book (skip R&D capitalization)")
+    p.add_argument("--price-scale", dest="price_scale", type=float, default=1.0,
+                   help="FX factor applied to the quote when it is in a different "
+                        "CURRENCY from the statements (e.g. GBPUSD spot for HSBA.L, which "
+                        "quotes in pence but reports in USD). GBp->GBP pence conversion is "
+                        "automatic and must NOT be included here.")
     p.add_argument("--years", type=int, default=10)
     p.add_argument("--draws", type=int, default=10000)
     p.add_argument("--method", choices=["hvz", "gls", "ct", "ojn", "peg"], default="hvz")
@@ -729,28 +820,42 @@ def main():
     p.add_argument("--bear", type=float, default=0.02)
     p.add_argument("--probs", default="0.25,0.50,0.25")
     a = p.parse_args()
+    _g5_defaulted = not any(x == "--growth5" or x.startswith("--growth5=") for x in sys.argv)
+    _g5_note = {"growth5_used": a.growth5,
+                "growth5_source": ("DEFAULT -- a 15% placeholder, NOT a company or consensus "
+                                   "estimate; pass --growth5 to set it"
+                                   if _g5_defaulted else "USER")}
+
+    def jprint_g(d):
+        """jprint, with the growth assumption stamped on any command that consumes it."""
+        if isinstance(d, dict):
+            d = dict(d, **{"_assumptions": _g5_note})
+        jprint(d)
+
 
     if a.cmd == "dcf":
-        jprint(dcf(a.ticker, a.growth5, a.fade, a.tg, a.wacc, a.fade_model, a.moat, a.normalize))
+        jprint_g(dcf(a.ticker, a.growth5, a.fade, a.tg, a.wacc, a.fade_model, a.moat, a.normalize,
+                   a.price_scale))
     elif a.cmd == "reverse":
-        jprint(reverse_dcf(a.ticker, a.wacc, a.tg, a.solve))
+        jprint(reverse_dcf(a.ticker, a.wacc, a.tg, a.solve, a.price_scale))
     elif a.cmd == "rim":
-        jprint(rim(a.ticker, a.coe, a.roe_fade_to, a.years, a.raw_book))
+        jprint(rim(a.ticker, a.coe, a.roe_fade_to, a.years, a.raw_book, a.price_scale))
     elif a.cmd == "mc":
-        jprint(montecarlo(a.ticker, a.draws, a.growth5, a.fade, a.tg, a.wacc))
+        jprint_g(montecarlo(a.ticker, a.draws, a.growth5, a.fade, a.tg, a.wacc, a.price_scale))
     elif a.cmd == "scenario":
         probs = [float(x) for x in a.probs.split(",")]
-        jprint(scenario(a.ticker, a.bull, a.base, a.bear, probs, a.fade, a.tg, a.wacc))
+        jprint_g(scenario(a.ticker, a.bull, a.base, a.bear, probs, a.fade, a.tg, a.wacc,
+                        a.price_scale))
     elif a.cmd == "icc":
-        jprint(icc(a.ticker, a.method, a.sustainable_roe))
+        jprint(icc(a.ticker, a.method, a.sustainable_roe, a.price_scale))
     elif a.cmd == "normalize":
         jprint(normalize(a.ticker))
     elif a.cmd == "comps":
         jprint(comps(a.ticker, parse_list(a.peers), a.warranted))
     elif a.cmd == "epv":
-        jprint(epv(a.ticker, a.wacc))
+        jprint(epv(a.ticker, a.wacc, a.price_scale))
     elif a.cmd == "netnet":
-        jprint(netnet(a.ticker))
+        jprint(netnet(a.ticker, a.price_scale))
 
 
 if __name__ == "__main__":

@@ -6,7 +6,6 @@ CLI:
   python dividend_analysis.py <TICKER> [--cost <your_cost_basis>]
 """
 import sys
-import numpy as np
 import pandas as pd
 import yfinance as yf
 from common import jprint, rnd, safe, stmt_val, main_guard

@@ -11,13 +11,10 @@ theses/**/*_err.txt
 theses/**/mcp-*.txt
 
 # Regenerable run artifacts — the markdown/JSON memory in theses/ stays tracked
-theses/**/*.csv
-theses/**/*.html
-theses/**/*.pdf
-theses/**/*.png
-theses/**/*.ipynb
 theses/**/logs/
 theses/**/.cache/
+theses/**/_info_cache/
+theses/**/*.pkl
 
 # Keep the offline smoke-test fixture whole (tests/ depends on it)
 !theses/NVDA-smoketest/**
@@ -25,3 +22,5 @@ theses/**/.cache/
 # Ad-hoc analysis scratch and archived one-off deliverables
 analysis/
 archive/
+*.pkl
+/.cache

@@ -41,6 +41,28 @@ def _safe(fn, label, errs):
         return None
 
 
+def _rate_spot_link(joined, current_diff):
+    """Correlation + linear fit of USD/JPY spot vs the US-JP 10y differential over whatever
+    window `joined` actually covers (>=60 obs). The window is reported from the data, not
+    asserted in the field name: yfinance's 5y spot history (preferred over FRED for
+    freshness) rarely reaches back to the ">= 2018-01-01" filter applied upstream, so a
+    hardcoded "since_2018" label silently drifts from the true fit window (e.g. an
+    actual 2021-08 -> 2026-06 window mislabeled as 2018-)."""
+    if joined is None or len(joined) <= 60:
+        return None
+    corr = float(joined["usdjpy"].corr(joined["us10_jp10_diff"]))
+    # simple beta: yen per dollar per 1pp of differential
+    b = np.polyfit(joined["us10_jp10_diff"], joined["usdjpy"], 1)
+    return {
+        "corr_window_start": str(joined.index[0].date()),
+        "corr_window_end": str(joined.index[-1].date()),
+        "corr": rnd(corr, 2),
+        "beta_usdjpy_per_1pp_diff": rnd(float(b[0]), 1),
+        "model_fit_intercept": rnd(float(b[1]), 1),
+        "fitted_fair_usdjpy_at_current_diff": rnd(float(b[0] * current_diff + b[1]), 1) if current_diff else None,
+    }
+
+
 def build_usdjpy(outdir):
     os.makedirs(outdir, exist_ok=True)
     errs = []
@@ -73,6 +95,7 @@ def build_usdjpy(outdir):
         out["spot"] = {
             "last": rnd(last, 2),
             "asof_date": str(px.index[-1].date()),
+            "asof_confirmed_session": bool(px.index[-1].weekday() < 5),
             "ret_1m_pct": ret(21), "ret_3m_pct": ret(63),
             "ret_6m_pct": ret(126), "ret_1y_pct": ret(252), "ytd_pct": ytd,
             "high_52w": rnd(float(win.max()), 2), "low_52w": rnd(float(win.min()), 2),
@@ -126,16 +149,9 @@ def build_usdjpy(outdir):
         joined = pd.concat([sp.rename("usdjpy"), diff], axis=1).dropna()
         joined = joined[joined.index >= "2018-01-01"]
         joined.to_csv(os.path.join(outdir, "usdjpy_diff.csv"))
-        if len(joined) > 60:
-            corr = float(joined["usdjpy"].corr(joined["us10_jp10_diff"]))
-            # simple beta: yen per dollar per 1pp of differential
-            b = np.polyfit(joined["us10_jp10_diff"], joined["usdjpy"], 1)
-            out["rate_spot_link"] = {
-                "corr_since_2018": rnd(corr, 2),
-                "beta_usdjpy_per_1pp_diff": rnd(float(b[0]), 1),
-                "model_fit_intercept": rnd(float(b[1]), 1),
-                "fitted_fair_usdjpy_at_current_diff": rnd(float(b[0] * out["rates"]["us10_jp10_diff"] + b[1]), 1) if out["rates"]["us10_jp10_diff"] else None,
-            }
+        link = _rate_spot_link(joined, out["rates"]["us10_jp10_diff"])
+        if link:
+            out["rate_spot_link"] = link
 
     # ---- Dollar index context ----
     if dxy is not None:
@@ -300,9 +316,20 @@ def main():
         jprint(fx_dollar())
     elif cmd == "basis":
         jprint(fx_basis())
-    else:  # "pack" (unchanged contract)
+    else:  # "pack"
+        # The default outdir used to be theses/<pair>, so a bare `fx_data.py pack` from any
+        # run silently OVERWROTE theses/USDJPY/ -- a dated run folder belonging to a different
+        # thesis. The 2026-07-30 portfolio run clobbered that run's 2026-07-03 fx_pack.json
+        # exactly this way. Dated run folders are the corpus's memory; a data-pack builder must
+        # never write into one it was not handed. The outdir is now required for that reason.
         pair = sys.argv[2] if len(sys.argv) > 2 else "USDJPY"
-        outdir = sys.argv[3] if len(sys.argv) > 3 else f"theses/{pair}"
+        if len(sys.argv) > 3:
+            outdir = sys.argv[3]
+        else:
+            raise SystemExit(
+                json.dumps({"error": "pack requires an explicit outdir",
+                            "usage": f"python fx_data.py pack {pair} <outdir>",
+                            "why": "defaulting to theses/<pair> overwrites a dated run folder"}))
         build_usdjpy(outdir)
 
 

@@ -30,7 +30,7 @@ For the committee's multi-month question, I bring a specific, testable lens: is 
 - Data pack: `factors.json` (`momentum_12_1_pct`, `momentum_6m_pct`, zscores vs peers), `technicals.json` (`pct_off_52w_high`, `vol_vs_20d_avg`, `trend_score_0_5`, `adx14`, `di_bias`, `ema50_vs_200`).
 - `python3 tools/quant_factors.py TICKER PEERS` — momentum factor and z-score composite vs a named peer set, essential for judging whether momentum is idiosyncratic or sector beta.
 - `python3 tools/technicals.py TICKER [period]` — trend/volume confirmation and 52-week-high proximity if the data pack looks stale.
-- `python3 tools/risk_sizing.py size TICKER --risk_pct 2.0` — ATR-based stop and sizing once a momentum setup clears my checklist, respecting the 2% NAV risk / 15% max position budget.
+- `python3 tools/risk_sizing.py size TICKER --risk_pct 3.0` — ATR-based stop and sizing once a momentum setup clears my checklist, respecting the 3% NAV risk / 20% max position budget.
 - Light web/news search only to check whether the momentum is event-driven (durable) or a single-headline spike (fragile) — I don't do deep fundamental work, that's the analyst bench's job.
 
 # Output contract

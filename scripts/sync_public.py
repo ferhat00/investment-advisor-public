@@ -9,6 +9,11 @@ Excluded from the public copy:
                      except theses/NVDA-smoketest/, a synthetic fixture the
                      test suite needs and that carries no real data.
   DECISION_LOG.md    running log of real decisions/trades/NAV.
+  *_ARTICLE_*.md     private write-ups / model-comparison articles authored
+                     off real runs (e.g. LJPY_MODEL_COMPARISON_ARTICLE_*.md).
+  .cache/            yfinance runtime cache (cookies/timezone DBs). Gitignored
+                     via /.cache but tracked from before that rule was added,
+                     so exclude it here too — never mirror runtime artifacts.
 
 Usage:
   python3 scripts/sync_public.py --remote <public-repo-git-url> [--branch main] [--push]
@@ -18,6 +23,7 @@ and leaves the staged tree on disk for inspection, without touching the
 remote.
 """
 import argparse
+import fnmatch
 import os
 import shutil
 import subprocess
@@ -26,8 +32,12 @@ import tempfile
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-EXCLUDE_PREFIXES = ("theses/",)
+EXCLUDE_PREFIXES = ("theses/", ".cache/")
 EXCLUDE_FILES = {"DECISION_LOG.md"}
+# Private write-ups / model-comparison articles authored off real runs. Matched
+# against the file's basename anywhere in the tree, so a dated article at the
+# repo root (or moved into a subfolder later) is always kept out of the mirror.
+EXCLUDE_GLOBS = ("*_ARTICLE_*.md",)
 KEEP_UNDER_EXCLUDED_PREFIX = ("theses/NVDA-smoketest/",)
 
 # Safety net: if these ever show up in the staged tree, something regressed
@@ -44,6 +54,9 @@ def tracked_files():
 def is_excluded(path):
     if path in EXCLUDE_FILES:
         return True
+    basename = os.path.basename(path)
+    if any(fnmatch.fnmatch(basename, glob) for glob in EXCLUDE_GLOBS):
+        return True
     for prefix in EXCLUDE_PREFIXES:
         if path.startswith(prefix):
             if any(path.startswith(keep) for keep in KEEP_UNDER_EXCLUDED_PREFIX):
@@ -52,7 +65,10 @@ def is_excluded(path):
     return False
 
 
-_SELF_PATH = os.path.relpath(os.path.abspath(__file__), ROOT)
+# Normalize to forward slashes: `git ls-files` always emits "/" separators, but
+# os.path.relpath uses the platform separator ("\" on Windows), so without this
+# the self-skip below never matches on Windows and the scan aborts on this file.
+_SELF_PATH = os.path.relpath(os.path.abspath(__file__), ROOT).replace(os.sep, "/")
 
 
 def scan_forbidden(staging, included):

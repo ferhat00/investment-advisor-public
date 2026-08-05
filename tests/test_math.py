@@ -12,6 +12,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 import common  # noqa: E402
 import decision_scoring  # noqa: E402
+import fx_data  # noqa: E402
+import positioning  # noqa: E402
 import risk_sizing  # noqa: E402
 
 FAILURES = []
@@ -104,6 +106,91 @@ def test_pot_var_es():
     check("pot es>var", es99 is not None and es99 > var99, f"es={es99:.3f}")
 
 
+def test_size_currency_bridge_and_leverage_cap():
+    # LJPY-2026-08-02 committee run: FXY/LJPY-like low-vol FX name sized against a GBP NAV,
+    # quoted in USD -- 3% risk / a ~1.12% 2xATR stop reproduced 268% NAV before this fix
+    # (cro/mean-reversion/position-trader seats all independently flagged it).
+    core = risk_sizing._size_core
+    last, atr = 65.0, 0.364                       # 2*atr/last = 1.12% (matches the bug report)
+    low_vol = core("FXY", last, atr, nav=100000.0, risk_pct=3.0, stop_atr_mult=2.0,
+                   vol_target=0.20, unit=1.0, fx=1.35, quote_ccy="USD", nav_ccy="GBP", vol_ann=0.08)
+    check("low-vol stop distance flagged as floored", low_vol["stop_distance_floored"] is True)
+    check("low-vol leverage capped near 100% (was 268%)",
+          95.0 <= low_vol["position_pct_nav"] <= 100.01, f"got {low_vol['position_pct_nav']}")
+    check("low-vol shares positive", low_vol["shares"] > 0, f"shares={low_vol['shares']}")
+
+    # Normal (non-pathological) same-currency case: stop is wide enough that the floor never
+    # engages -- must reproduce the pre-fix formula exactly (no regression for typical names).
+    same_ccy = core("NVDA", 100.0, 5.0, nav=100000.0, risk_pct=3.0, stop_atr_mult=2.0,
+                    vol_target=0.20, unit=1.0, fx=1.0, quote_ccy="USD", nav_ccy="USD", vol_ann=0.30)
+    check("unfloored same-ccy shares match pre-fix formula", same_ccy["shares"] == 300,
+          f"shares={same_ccy['shares']}")
+    check("unfloored same-ccy position_pct_nav matches pre-fix formula",
+          same_ccy["position_pct_nav"] == 30.0, f"pct={same_ccy['position_pct_nav']}")
+    check("floor not applied when stop is wide", same_ccy["stop_distance_floored"] is False)
+
+    # Same setup, cross-currency (GBP NAV, USD quote, fx=1.35): shares/position_value must
+    # scale with the FX rate -- previously risk_amt (GBP) was divided by stop_dist (USD) with
+    # NO conversion at all. position_pct_nav is FX-invariant by construction (a pure
+    # risk_pct/stop_distance_pct ratio), so it must still match the same-currency case exactly.
+    cross_ccy = core("NVDA", 100.0, 5.0, nav=100000.0, risk_pct=3.0, stop_atr_mult=2.0,
+                     vol_target=0.20, unit=1.0, fx=1.35, quote_ccy="USD", nav_ccy="GBP", vol_ann=0.30)
+    check("cross-ccy shares scale by the fx rate (was mixed with no conversion)",
+          cross_ccy["shares"] == 405, f"shares={cross_ccy['shares']}")
+    check("cross-ccy position_pct_nav still matches same-ccy (fx-invariant ratio)",
+          cross_ccy["position_pct_nav"] == same_ccy["position_pct_nav"],
+          f"{cross_ccy['position_pct_nav']} vs {same_ccy['position_pct_nav']}")
+    check("cross-ccy note explains the FX bridge", "FX-converted" in cross_ccy["note_currency"])
+    check("cross-ccy position_value_nav_ccy back-converted",
+          abs(cross_ccy["position_value_nav_ccy"] - same_ccy["position_value"]) < 1.0,
+          f"{cross_ccy['position_value_nav_ccy']} vs {same_ccy['position_value']}")
+
+    # _fx_rate offline fast paths (same currency / missing currency -- no network attempted)
+    check("fx_rate same currency -> 1.0", risk_sizing._fx_rate("GBP", "GBP") == 1.0)
+    check("fx_rate missing currency -> 1.0", risk_sizing._fx_rate(None, "USD") == 1.0)
+
+
+# --- positioning.py COT direction -------------------------------------------------
+
+def test_positioning_direction_4w():
+    d = positioning._direction_4w
+    # LJPY-2026-08-02 committee run: net short grew -155,092 -> -163,412; the old
+    # `last > prev` comparison read this as "reducing" (backwards for a short).
+    check("growing short -> building", d(-163412, -155092) == "building")
+    # USDJPY-2026-07-14 redteam-bear report: net short covered -145,818 -> -123,778 (specs
+    # bought back ~22k contracts); the old comparison read this as "building" (also backwards).
+    check("covering short -> reducing", d(-123778, -145818) == "reducing")
+    # Net longs: unchanged behavior, sanity check against the same helper.
+    check("growing long -> building", d(150, 100) == "building")
+    check("reducing long -> reducing", d(100, 150) == "reducing")
+    check("no change -> unchanged", d(100, 100) == "unchanged")
+    check("no 4w-ago data -> None", d(100, None) is None)
+
+
+# --- fx_data.py rate/spot link ------------------------------------------------------
+
+def test_fx_corr_window_computed():
+    # fx_pack.json's rate_spot_link.corr_since_2018 was a hardcoded label even though the
+    # actual join window tracks yfinance's 5y spot lookback (rarely reaches back to 2018) --
+    # reproduced as an actual 2021-08 -> 2026-06 window mislabeled "since_2018". The window
+    # must now be read from the data, not asserted in a field name.
+    import pandas as pd
+    idx = pd.date_range("2021-08-02", periods=200, freq="D")
+    rng = np.random.default_rng(5)
+    diff = pd.Series(rng.normal(2.0, 0.3, len(idx)), index=idx)
+    usdjpy = 130 + 5 * diff + rng.normal(0, 1, len(idx))
+    joined = pd.DataFrame({"usdjpy": usdjpy, "us10_jp10_diff": diff.values}, index=idx)
+    link = fx_data._rate_spot_link(joined, current_diff=2.0)
+    check("corr_window_start reflects actual data start", link["corr_window_start"] == "2021-08-02",
+          f"got {link['corr_window_start']}")
+    check("corr_window_end reflects actual data end", link["corr_window_end"] == str(idx[-1].date()),
+          f"got {link['corr_window_end']}")
+    check("window not silently mislabeled 2018", not link["corr_window_start"].startswith("2018"))
+    check("no stale corr_since_2018 key", "corr_since_2018" not in link)
+    check("corr field present", link.get("corr") is not None)
+    check("short window (<=60 obs) returns None", fx_data._rate_spot_link(joined.iloc[:10], 2.0) is None)
+
+
 # --- decision_scoring parsers ----------------------------------------------------
 
 def test_parse_ref_price():
@@ -130,6 +217,31 @@ def test_parse_log_invariants():
     market = [e for e in entries if e.get("type") == "thesis"]
     missing = [e["id"] for e in market if not e.get("tickers") or not e.get("ref_price_raw")]
     check("thesis entries have machine lines", not missing, f"missing={missing}")
+
+
+def test_minor_unit_scale():
+    # "GBp" (pence) and "GBP" (pounds) differ only by case — an .upper() in the lookup
+    # would divide every pound-quoted name by 100.
+    check("GBp is pence", common.minor_unit_scale({"currency": "GBp"}) == 0.01)
+    check("GBX is pence", common.minor_unit_scale({"currency": "GBX"}) == 0.01)
+    check("GBP is NOT scaled", common.minor_unit_scale({"currency": "GBP"}) == 1.0)
+    check("USD is not scaled", common.minor_unit_scale({"currency": "USD"}) == 1.0)
+    check("missing currency is safe", common.minor_unit_scale({}) == 1.0)
+    check("None info is safe", common.minor_unit_scale(None) == 1.0)
+
+
+def test_quote_price():
+    # An LSE bank at 671.82p against a book value in pounds must price as 6.7182.
+    px = common.quote_price({"currency": "GBp", "currentPrice": 671.82})
+    check("GBp quote -> pounds", abs(px - 6.7182) < 1e-9, f"got {px}")
+    check("USD quote unchanged",
+          common.quote_price({"currency": "USD", "currentPrice": 127.13}) == 127.13)
+    # Cross-currency: quotes pence, reports USD -> pence fix AND an explicit FX factor.
+    px = common.quote_price({"currency": "GBp", "currentPrice": 1574.6}, price_scale=1.35)
+    check("GBp quote x FX", abs(px - 21.2571) < 1e-6, f"got {px}")
+    check("no price -> None", common.quote_price({"currency": "GBp"}) is None)
+    check("regularMarketPrice fallback",
+          common.quote_price({"currency": "USD", "regularMarketPrice": 10.0}) == 10.0)
 
 
 if __name__ == "__main__":

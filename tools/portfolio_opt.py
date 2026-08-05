@@ -20,7 +20,6 @@ CLI:
 """
 import argparse
 import json
-import sys
 import numpy as np
 import pandas as pd
 from common import jprint, rnd, parse_list, yf_history, main_guard

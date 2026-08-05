@@ -18,7 +18,6 @@ capitulation proxy for a non-fundamental seller, and flags what is missing.
 CLI: python flow_pressure.py NVDA
 """
 import sys
-import numpy as np
 from common import jprint, rnd, yf_history, flow_data, main_guard
 
 

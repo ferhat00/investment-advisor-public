@@ -2,14 +2,14 @@
 CLI:
   python risk_sizing.py stats NVDA
   python risk_sizing.py corr NVDA SPY,QQQ,TLT,GLD
-  python risk_sizing.py size NVDA --nav 100000 --risk_pct 1.0 --stop_atr 2
+  python risk_sizing.py size NVDA --nav 100000 --risk_pct 3.0 --stop_atr 2
   python risk_sizing.py arbgate NVDA --mispricing_pct 75 --catalyst_days 30 --borrow_fee_bps 500 [--momentum_crash]
 """
-import sys, argparse, json, os
+import argparse, json, os
 import numpy as np
 import pandas as pd
 from common import (yf_history, jprint, rnd, realized_vol_ann, fred, zscore_last,
-                    safe, _norm_pdf, _norm_cdf, main_guard, parse_list)
+                    safe, _norm_pdf, main_guard, parse_list, minor_unit_scale)
 
 # Standard-normal quantiles (numpy-only; the repo avoids scipy). Used by the parametric
 # and Cornish-Fisher tail readouts below.
@@ -56,37 +56,142 @@ def corr(ticker, others):
     df = pd.DataFrame(px).dropna()
     return {f"corr_{ticker}_vs_{c}": rnd(df[ticker].corr(df[c]), 2) for c in others}
 
-def size(ticker, nav, risk_pct, stop_atr_mult, vol_target=0.20):
+_MINOR_TO_MAJOR_CCY = {"GBp": "GBP", "GBX": "GBP", "ZAc": "ZAR", "ILA": "ILS"}
+
+# Below this fraction of the VOL_WINDOW showing an exact zero daily return, flag it as
+# possible non-printing/stale-quote days (common on thin FX crosses) rather than silently
+# trust a realized vol that a stale feed has deflated. Detection only — the tool reports the
+# flag rather than auto-correcting the vol, since a genuinely flat trading day is legitimate
+# too and a heuristic "fix" risks being wrong in the other direction.
+STALE_DAY_FLAG_PCT = 8.0
+
+
+def _quote_info(ticker):
+    """Best-effort (unit_scale, major_ccy) for a ticker's Yahoo quote: unit_scale converts a
+    minor-unit quote into its major currency unit (GBp -> GBP, 0.01), and major_ccy is that
+    major unit's ISO code, used for the cross-currency FX bridge in size(). (1.0, None) if
+    the info scrape fails — sizing must not die on a flaky info scrape."""
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info or {}
+    except Exception:  # noqa: BLE001 — sizing must not die on a flaky info scrape
+        return 1.0, None
+    ccy = info.get("currency")
+    return minor_unit_scale(info), _MINOR_TO_MAJOR_CCY.get(ccy, ccy)
+
+
+def _fx_rate(from_ccy, to_ccy, errs=None):
+    """Live FX rate converting an amount in `from_ccy` into `to_ccy`
+    (amount_to = amount_from * rate). 1.0 if the currencies already match, either is
+    unknown, or the quote can't be resolved (noted in `errs`) — the same
+    degrade-to-unconverted fallback used across the tool library (portfolio_opt._fx_to_base,
+    trade_stats.to_gbp)."""
+    if not from_ccy or not to_ccy:
+        return 1.0
+    from_ccy, to_ccy = from_ccy.upper(), to_ccy.upper()
+    if from_ccy == to_ccy:
+        return 1.0
+    try:
+        return float(yf_history(f"{from_ccy}{to_ccy}=X", period="5d")["Close"].iloc[-1])
+    except Exception as e:
+        if errs is not None:
+            errs.append(f"fx_{from_ccy}{to_ccy}: {e}")
+        return 1.0
+
+
+def _size_core(ticker, last, atr, nav, risk_pct, stop_atr_mult, vol_target, unit, fx,
+               quote_ccy, nav_ccy, vol_ann):
+    """Pure risk-based + vol-target sizing arithmetic (no I/O) — see size() for the
+    data-fetch wrapper. `fx` converts an amount in nav_ccy into quote_ccy
+    (amount_quote = amount_nav_ccy * fx); pass fx=1.0 when quote_ccy == nav_ccy or is
+    unknown.
+
+    Two fixes over the original formula (both reproduced on FXY/LJPY, a low-vol FX name,
+    against a GBP NAV — see DECISION_LOG / LJPY-2026-08-02 committee run):
+
+    1. Currency bridge: risk_amt (nav_ccy) used to be divided by stop_dist (quote_ccy)
+       directly, silently mixing currencies whenever quote_ccy != nav_ccy (~1.35x off at
+       GBPUSD~1.35). risk_amt is now converted into quote_ccy before sizing shares, and
+       position_value is converted back into nav_ccy (position_value_nav_ccy) for an
+       apples-to-apples position_pct_nav.
+    2. Leverage cap: the risk leg alone (risk_pct / stop_distance_pct) is otherwise
+       uncapped — a tight ATR-based stop on a low-vol name can imply well over 100% NAV
+       (3% risk / a 1.12% 2xATR stop = 268% NAV). The stop distance used for sizing is
+       floored at last*risk_pct/100 (the distance at which the risk leg exactly implies
+       100% NAV), so implied leverage from this leg can never exceed ~100% NAV.
+    """
+    stop_dist_raw = stop_atr_mult * atr
+    risk_amt = nav * risk_pct / 100
+    risk_amt_quote = risk_amt * fx
+    min_stop_dist = last * risk_pct / 100
+    stop_dist = max(stop_dist_raw, min_stop_dist)
+    stop_floored = stop_dist > stop_dist_raw
+    shares = int(risk_amt_quote / (stop_dist * unit)) if stop_dist > 0 and unit > 0 else 0
+    pos_val = shares * last * unit
+    pos_val_nav = pos_val / fx if fx else pos_val
+    vt_weight = min(100.0, 100 * vol_target / vol_ann) if vol_ann and vol_ann > 0 else None
+    cross_ccy = bool(quote_ccy and quote_ccy != nav_ccy)
+    if quote_ccy is None:
+        note_currency = "quote currency unresolvable (info scrape failed); FX conversion skipped, treated as nav_ccy"
+    elif cross_ccy:
+        note_currency = (f"position_value is in {quote_ccy}; FX-converted at 1 {nav_ccy} = "
+                         f"{rnd(fx, 4)} {quote_ccy} into position_value_nav_ccy, which "
+                         f"position_pct_nav uses")
+    else:
+        note_currency = "quote currency matches nav_ccy; no FX conversion needed"
+    return {
+        "ticker": ticker, "last": rnd(last), "atr14": rnd(atr),
+        "stop_price": rnd(last - stop_dist), "stop_distance_pct": rnd(100 * stop_dist / last) if last else None,
+        "stop_distance_floored": stop_floored,
+        "risk_amount": rnd(risk_amt, 0), "risk_amount_ccy": nav_ccy, "shares": shares,
+        "position_value": rnd(pos_val, 0), "position_value_ccy": quote_ccy or nav_ccy,
+        "position_value_nav_ccy": rnd(pos_val_nav, 0),
+        "position_pct_nav": rnd(100 * pos_val_nav / nav, 1) if nav else None,
+        "quote_unit_scale": unit,
+        "fx_nav_ccy_to_quote_ccy": rnd(fx, 4) if cross_ccy else None,
+        "note_currency": note_currency,
+        "vol_ann_63d_pct": rnd(100 * vol_ann) if vol_ann is not None else None,
+        "vol_target_ann_pct": rnd(100 * vol_target),
+        "vol_target_weight_pct": rnd(vt_weight, 1),
+        "note_vol_target": (f"to run this name at a {vol_target:.0%} standalone vol budget "
+                            f"(asset vol {vol_ann:.0%}), weight ≈ {rnd(vt_weight, 1)}% NAV; "
+                            f"cut it in high-vol regimes") if vol_ann is not None else None,
+    }
+
+
+def size(ticker, nav, risk_pct, stop_atr_mult, vol_target=0.20, nav_ccy="GBP"):
     """Risk-based sizing: risk_pct of NAV lost if stop (stop_atr_mult x ATR) hit,
     plus a volatility-target weight (Moreira-Muir 2017) that scales exposure
-    inversely to realized vol so risk — not notional — is held roughly constant."""
+    inversely to realized vol so risk — not notional — is held roughly constant.
+    NAV and risk_pct are denominated in `nav_ccy` (default GBP, the fund's base currency —
+    matches portfolio_opt.py/trade_stats.py); see _size_core for the currency-bridge and
+    leverage-cap fixes applied on top of the raw ATR-stop formula."""
     df = yf_history(ticker, period="1y")
-    import pandas as pd
     tr = pd.concat([df.High - df.Low, (df.High - df.Close.shift()).abs(),
                     (df.Low - df.Close.shift()).abs()], axis=1).max(axis=1)
     atr = float(tr.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
     last = float(df.Close.iloc[-1])
-    stop_dist = stop_atr_mult * atr
-    risk_amt = nav * risk_pct / 100
-    shares = int(risk_amt / stop_dist)
-    pos_val = shares * last
+    nav_ccy = (nav_ccy or "GBP").upper()
+    unit, quote_ccy = _quote_info(ticker)
+    errs = []
+    fx = _fx_rate(nav_ccy, quote_ccy, errs)
     r = df.Close.pct_change().dropna()
     vol_ann = realized_vol_ann(r, VOL_WINDOW)                # trailing quarter — same as stats()
-    vt_weight = min(100.0, 100 * vol_target / vol_ann) if vol_ann > 0 else None
-    return {
-        "ticker": ticker, "last": rnd(last), "atr14": rnd(atr),
-        "stop_price": rnd(last - stop_dist), "stop_distance_pct": rnd(100 * stop_dist / last),
-        "risk_amount": rnd(risk_amt, 0), "shares": shares,
-        "position_value": rnd(pos_val, 0), "position_pct_nav": rnd(100 * pos_val / nav, 1),
-        "vol_ann_63d_pct": rnd(100 * vol_ann),
-        "vol_target_ann_pct": rnd(100 * vol_target),
-        "vol_target_weight_pct": rnd(vt_weight, 1),
-        "note_vol_target": f"to run this name at a {vol_target:.0%} standalone vol budget "
-                           f"(asset vol {vol_ann:.0%}), weight ≈ {rnd(vt_weight, 1)}% NAV; "
-                           f"cut it in high-vol regimes",
-    }
+    out = _size_core(ticker, last, atr, nav, risk_pct, stop_atr_mult, vol_target, unit, fx,
+                     quote_ccy, nav_ccy, vol_ann)
+    window_r = r.tail(VOL_WINDOW)
+    if len(window_r):
+        stale_pct = 100 * float((window_r == 0).mean())
+        out["vol_window_stale_days_pct"] = rnd(stale_pct, 1)
+        if stale_pct >= STALE_DAY_FLAG_PCT:
+            out["note_stale_vol"] = (f"{rnd(stale_pct, 0)}% of the {VOL_WINDOW}d vol window is an exact "
+                                     f"zero return (possible non-printing/stale quotes, common on thin "
+                                     f"FX crosses) — vol_ann_63d_pct may be UNDERSTATED")
+    if errs:
+        out["errors"] = errs
+    return out
 
-def kelly(win_p, win_loss_ratio, fraction=0.25):
+def kelly(win_p, win_loss_ratio, fraction=0.33):
     f = win_p - (1 - win_p) / win_loss_ratio
     return {"full_kelly_pct": rnd(100 * f, 1), "fractional_kelly_pct": rnd(100 * f * fraction, 1),
             "fraction_used": fraction}
@@ -113,13 +218,36 @@ def _macro_funding_stress():
     return fs
 
 
-def macro_size(ticker, nav, risk_pct, stop_atr_mult, vol_target=0.20, funding_stress_override=False):
+def _sizing_artifact_warning(weight_pct, vol_ann_pct):
+    """Shared low-vol/low-CVaR sizing-artifact flag for macro_size/esbudget/ddbudget: all three cap
+    a weight by inverting a small risk denominator (realized vol, CVaR, or CDaR) with no input for
+    liquidity, wrapper constraints, counterparty risk, or holding-period cost, so on an illiquid
+    low-vol name (FX ETPs are the documented case — FXY: macro_size 268.4% NAV, esbudget 73.5%,
+    ddbudget 44.9%, one shared denominator) the output is not a usable position size. Flags, does
+    not resize or block. Refs: DEC-054; LJPY-2026-08-02 tail-risk report §8."""
+    if weight_pct is None:
+        return None
+    reasons = []
+    if weight_pct > 25.0:
+        reasons.append(f"computed weight {weight_pct:g}% NAV > 25% sanity ceiling")
+    if vol_ann_pct is not None and vol_ann_pct < 10.0:
+        reasons.append(f"annualised realised vol {vol_ann_pct:g}% < 10% low-vol threshold")
+    if not reasons:
+        return None
+    return ("SIZING ARTIFACT (" + "; ".join(reasons) + "): this weight inverts a low realised-vol/"
+            "loss-budget denominator with no liquidity, wrapper, counterparty, or holding-period-cost "
+            "input — do not read it as a position size on an illiquid/low-vol name without a separate "
+            "liquidity check. Refs: DEC-054; LJPY-2026-08-02 tail-risk report §8.")
+
+
+def macro_size(ticker, nav, risk_pct, stop_atr_mult, vol_target=0.20, funding_stress_override=False,
+               nav_ccy="GBP"):
     """Crash-aware macro sizing: the risk_sizing.size() base weight, then CONDITIONAL
     vol-targeting (scale to the vol budget only in an elevated-vol regime — Moreira-Muir 2017;
     Malitsky 2021 — rather than always, to avoid over-hedging bull trends) and a funding/
     carry-crash guard that cuts size on a momentum-crash regime or funding stress
     (Daniel-Moskowitz 2016; Daniel-Hodrick-Lu 2017 carry drawdowns)."""
-    base = size(ticker, nav, risk_pct, stop_atr_mult, vol_target)
+    base = size(ticker, nav, risk_pct, stop_atr_mult, vol_target, nav_ccy)
     st = stats(ticker)
     vol_regime, crash = st["vol_regime"], st["momentum_crash_flag"]
     fs = _macro_funding_stress()
@@ -154,8 +282,9 @@ def macro_size(ticker, nav, risk_pct, stop_atr_mult, vol_target=0.20, funding_st
         "funding_stress": fs, "funding_stress_on": stress_on,
         "crash_guard_multiplier": mult,
         "recommended_pct_nav": recommended,
+        "sizing_artifact_warning": _sizing_artifact_warning(recommended, base.get("vol_ann_63d_pct")),
         "reads": reads,
-        "note": "Conditional vol-targeting + funding/carry-crash guard applied on top of the 2%-risk "
+        "note": "Conditional vol-targeting + funding/carry-crash guard applied on top of the 3%-risk "
                 "base size. Refs: Moreira-Muir 2017; Malitsky 2021; Daniel-Moskowitz 2016; Daniel-Hodrick-Lu 2017.",
     }
 
@@ -943,17 +1072,22 @@ def esbudget(ticker, nav=100000, tail_budget_pct=3.0, alpha=0.95, horizon_days=1
     """CVaR tail-loss-budget sizing: the max weight whose horizon CVaR fits a tail-loss budget.
     Because CVaR is left-tail-dominated, it sizes fat-tailed names down harder than same-vol
     symmetric names. Refs: Rockafellar-Uryasev 2000/2002 (J. Risk / JBF 26)."""
-    r = _ret(ticker, period="3y").values
+    r_ser = _ret(ticker, period="3y")
+    r = r_ser.values
     var_a = np.percentile(r, 100 * (1 - alpha))
     cvar_d = float(r[r <= var_a].mean())               # daily CVaR (negative)
     cvar_h = cvar_d * np.sqrt(horizon_days)
     tb = tail_budget_pct / 100.0
     w = min(1.0, tb / abs(cvar_h)) if cvar_h < 0 else 1.0
+    vol_ann_pct = rnd(100 * realized_vol_ann(r_ser, VOL_WINDOW), 1)
+    max_weight_pct = rnd(100 * w, 1)
     return {
         "ticker": ticker, "alpha": alpha, "horizon_days": horizon_days, "tail_budget_pct": tail_budget_pct,
         "cvar_daily_pct": rnd(100 * cvar_d, 2), "cvar_horizon_pct": rnd(100 * cvar_h, 2),
-        "max_weight_pct": rnd(100 * w, 1),
+        "vol_ann_63d_pct": vol_ann_pct,
+        "max_weight_pct": max_weight_pct,
         "max_position_value": rnd(nav * w, 0),
+        "sizing_artifact_warning": _sizing_artifact_warning(max_weight_pct, vol_ann_pct),
         "read": f"to keep {int(horizon_days)}d CVaR({int(alpha*100)}%) within a {tail_budget_pct}% NAV tail budget, "
                 f"cap weight at ~{rnd(100*w,1)}% NAV",
         "note": "Empirical CVaR + sqrt-time horizon scaling; single-name scalar inversion (not a portfolio LP). Rockafellar-Uryasev 2000.",
@@ -964,23 +1098,28 @@ def ddbudget(ticker, nav=100000, dd_budget_pct=15.0, beta=0.90):
     """CDaR drawdown-budget sizing + a Grossman-Zhou (1993) surplus note: cap weight so the
     conditional drawdown fits a max-drawdown budget. Ref: Chekhlov-Uryasev-Zabarankin 2005."""
     px = yf_history(ticker, period="5y")["Close"]
+    ret = px.pct_change().dropna()
     dd = (px / px.cummax() - 1).values
     thr = np.percentile(dd, 100 * (1 - beta))
     cdar = float(dd[dd <= thr].mean())                 # conditional drawdown-at-risk (negative)
-    exp_mdd = _expected_mdd(float(px.pct_change().dropna().std()), len(px))
+    exp_mdd = _expected_mdd(float(ret.std()), len(px))
     db = dd_budget_pct / 100.0
     w = min(1.0, db / abs(cdar)) if cdar < 0 else 1.0
+    vol_ann_pct = rnd(100 * realized_vol_ann(ret, VOL_WINDOW), 1)
+    max_weight_pct = rnd(100 * w, 1)
     return {
         "ticker": ticker, "beta": beta, "dd_budget_pct": dd_budget_pct,
         "cdar_pct": rnd(100 * cdar, 1), "expected_mdd_null_pct": rnd(-100 * exp_mdd, 1),
-        "max_weight_pct": rnd(100 * w, 1), "max_position_value": rnd(nav * w, 0),
+        "vol_ann_63d_pct": vol_ann_pct,
+        "max_weight_pct": max_weight_pct, "max_position_value": rnd(nav * w, 0),
+        "sizing_artifact_warning": _sizing_artifact_warning(max_weight_pct, vol_ann_pct),
         "read": f"to keep the conditional drawdown within a {dd_budget_pct}% NAV budget, cap weight at ~{rnd(100*w,1)}% NAV; "
                 "tighten the brake automatically as the holding approaches its drawdown floor (Grossman-Zhou surplus)",
         "note": "Empirical CDaR (mean of worst 1-beta drawdowns); Grossman-Zhou 1993 surplus principle. Chekhlov et al. 2005.",
     }
 
 
-def kelly_tail(ticker, fraction=0.25, dd_threshold=20.0):
+def kelly_tail(ticker, fraction=0.33, dd_threshold=20.0):
     """Fat-tail fractional Kelly: shrink the growth-optimal fraction for skew/excess-kurtosis
     (Cornish-Fisher) and report P(drawdown > threshold). The current Gaussian kelly() over-bets
     fat-tailed names. Refs: MacLean-Thorp-Ziemba 2010 (Quant.Finance 10); Favre-Galeano 2002 (JAI 5)."""
@@ -1089,8 +1228,9 @@ def condcorr(ticker, market="SPY", book=None, lam=0.94, floor=0.8):
 def main():
     p = argparse.ArgumentParser(); p.add_argument("cmd"); p.add_argument("ticker")
     p.add_argument("others", nargs="?", default="SPY,QQQ,TLT,GLD")
-    p.add_argument("--nav", type=float, default=100000); p.add_argument("--risk_pct", type=float, default=1.0)
+    p.add_argument("--nav", type=float, default=100000); p.add_argument("--risk_pct", type=float, default=3.0)
     p.add_argument("--stop_atr", type=float, default=2.0)
+    p.add_argument("--nav_ccy", default="GBP")
     p.add_argument("--vol_target", type=float, default=0.20)
     p.add_argument("--win_p", type=float, default=0.55); p.add_argument("--wl", type=float, default=1.5)
     p.add_argument("--mispricing_pct", type=float, default=None)
@@ -1118,7 +1258,7 @@ def main():
     p.add_argument("--dd_budget_pct", type=float, default=15.0)
     p.add_argument("--dd_threshold", type=float, default=20.0)
     p.add_argument("--horizon", type=int, default=10)
-    p.add_argument("--fraction", type=float, default=0.25)
+    p.add_argument("--fraction", type=float, default=0.33)
     p.add_argument("--n_boot", type=int, default=2000)
     p.add_argument("--floor", type=float, default=0.8)
     p.add_argument("--stat", default="cvar")
@@ -1126,10 +1266,10 @@ def main():
     _floats = lambda s: tuple(float(x) for x in s.split(",") if x != "")
     if a.cmd == "stats": jprint(stats(a.ticker))
     elif a.cmd == "corr": jprint(corr(a.ticker, parse_list(a.others)))
-    elif a.cmd == "size": jprint(size(a.ticker, a.nav, a.risk_pct, a.stop_atr, a.vol_target))
+    elif a.cmd == "size": jprint(size(a.ticker, a.nav, a.risk_pct, a.stop_atr, a.vol_target, a.nav_ccy))
     elif a.cmd == "kelly": jprint(kelly(a.win_p, a.wl))
     elif a.cmd == "macro_size": jprint(macro_size(a.ticker, a.nav, a.risk_pct, a.stop_atr,
-                                                  a.vol_target, a.funding_stress))
+                                                  a.vol_target, a.funding_stress, a.nav_ccy))
     elif a.cmd == "arbgate": jprint(arb_gate(a.ticker, a.mispricing_pct, a.catalyst_days,
                                              a.horizon_days, a.borrow_fee_bps, a.momentum_crash))
     # ── tail-risk battery ──

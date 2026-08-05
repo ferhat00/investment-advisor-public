@@ -23,7 +23,7 @@ Gabaix-Gopikrishnan-Plerou-Stanley 2003 (Nature 423); Hill 1975 (Ann. Statistics
 Breeden & Litzenberger 1978 (J. Business 51(4)); Israelov 2019 (JAI 21(3)); Whaley 2002 (J.
 Derivatives 10(2)). numpy/pandas + free yfinance only (no scipy/statsmodels).
 """
-import sys, argparse, math
+import argparse, math
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -207,7 +207,7 @@ def hedge(ticker, otm=0.12, dte=90, notional=100000, structure="auto"):
     c = _chain(ticker, dte)
     if c is None:
         return {"ticker": ticker, "error": "no listed options"}
-    spot, T = c["spot"], c["dte"] / 365.0
+    spot = c["spot"]
     kp = spot * (1 - otm)
     put_prem, kp = _mid(c["puts"], kp)
     kp2 = spot * (1 - 2 * otm)

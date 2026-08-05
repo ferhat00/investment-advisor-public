@@ -27,7 +27,7 @@ FAILURES = []
 NETWORK_DEFAULT = {"macro_data.py", "cross_asset.py", "sentiment_regime.py",
                    "fx_data.py", "positioning.py", "commodity_carry.py",
                    "decision_scoring.py"}
-PURE_LIBS = {"common.py", "lm_dictionary.py"}
+PURE_LIBS = {"common.py", "lm_dictionary.py", "yahoo_urllib.py"}
 
 
 def check(name, cond, detail=""):
